@@ -1,0 +1,42 @@
+name: Build Windows .exe
+
+on:
+  workflow_dispatch:   # lets you trigger it manually from the Actions tab
+  push:
+    paths:
+      - "app.py"
+      - "launcher.py"
+      - "requirements-build.txt"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Build with PyInstaller
+        run: >
+          pyinstaller --onedir --name SensorStreamMonitor
+          --collect-all streamlit
+          --collect-all plotly
+          --copy-metadata streamlit
+          --copy-metadata pandas
+          --copy-metadata numpy
+          --copy-metadata scipy
+          --copy-metadata plotly
+          --add-data "app.py;."
+          --noconfirm
+          launcher.py
+
+      - name: Upload build as downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SensorStreamMonitor-windows
+          path: dist/SensorStreamMonitor/
