@@ -26,6 +26,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from io import StringIO
 
 import numpy as np
@@ -386,6 +387,39 @@ def plot_distribution(df: pd.DataFrame, col: str) -> go.Figure:
     return fig
 
 
+def export_plot_png(
+    fig: go.Figure,
+    folder: str,
+    channel: str,
+    window_start: float,
+    window_end: float,
+    plot_name: str,
+) -> tuple[bool, str]:
+    """Write one Plotly figure to <folder> as a PNG. Filename = real-world export time
+    (what you asked for) + the window's elapsed-second range (so exports from different
+    windows don't collide or look identical — the Time column itself has no real calendar
+    timestamp, only elapsed seconds, so this is the closest stand-in).
+    Returns (success, full_path_or_error_message)."""
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        return False, f"Could not create/access folder '{folder}': {e}"
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = (
+        f"{timestamp}_{channel}_{window_start:.0f}-{window_end:.0f}s_{plot_name}.png"
+    )
+    full_path = os.path.join(folder, filename)
+    try:
+        fig.write_image(full_path, format="png", width=1200, height=700, scale=2)
+        return True, full_path
+    except Exception as e:
+        return False, (
+            f"PNG export failed ({e}). This usually means the 'kaleido' package "
+            f"isn't installed — run: pip install kaleido"
+        )
+
+
 def segment_into_windows(df: pd.DataFrame, window_seconds: float):
     """Split a full DataFrame into sequential [start, end) windows by Time.
     Used for manually-supplied (already-complete) data, as opposed to the
@@ -475,7 +509,7 @@ st.set_page_config(page_title="Sensor Stream Monitor", layout="wide")
 
 st.sidebar.header("Configuration")
 live_source_mode = st.sidebar.radio(
-    "Live data source", ["Local file", "URL (polled)"], horizontal=True
+    "Live data source", ["Local file", "URL (polled)"], horizontal=True, index=1
 )
 if live_source_mode == "Local file":
     file_path = st.sidebar.text_input(
@@ -522,6 +556,25 @@ channel = st.sidebar.selectbox(
     "Channel to analyze", ANALYZABLE_CHANNELS, index=1
 )  # default POWER
 
+st.sidebar.divider()
+st.sidebar.subheader("Plot Export")
+export_enabled = st.sidebar.checkbox(
+    "Auto-export plots when a new live window completes", value=False
+)
+export_folder = st.sidebar.text_input(
+    "Export folder path",
+    placeholder=r"C:\Exports\SensorPlots or /home/user/exports",
+    disabled=not export_enabled,
+)
+st.sidebar.caption(
+    "A local folder on the machine running this app — not a cloud link. Saves 4 PNGs "
+    "(time series, FFT, distribution, peak-envelope/shape) each time a live-stream window "
+    "finishes, filenamed by real export time + the window's elapsed-second range. "
+    "Manual Data Entry is not auto-exported."
+)
+if export_enabled and not export_folder.strip():
+    st.sidebar.warning("Enter a folder path above, or exports will be skipped.")
+
 reset_label = (
     "Reset stream (re-read file from byte 0)"
     if live_source_mode == "Local file"
@@ -542,6 +595,8 @@ for key, default in [
     ("current_window", None),
     ("manual_df", pd.DataFrame(columns=COLUMNS)),
     ("last_upload_sig", None),
+    ("last_export_results", None),
+    ("last_export_time", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -572,6 +627,79 @@ if window_ready:
     mask = (buf["Time"] >= st.session_state.window_start) & (buf["Time"] < window_end)
     st.session_state.current_window = buf.loc[mask].copy()
     st.session_state.buffer = buf.loc[buf["Time"] >= window_end].copy()
+
+    # --- auto-export, exactly once per completed window (this block only runs on a
+    # window transition, not on every poll) — Manual Data Entry is untouched by design ---
+    if export_enabled and export_folder.strip():
+        w_export = st.session_state.current_window
+        w_start, w_end = w_export["Time"].min(), w_export["Time"].max()
+        export_results = []
+
+        ts_fig = plot_timeseries(w_export, channel)
+        export_results.append(
+            (
+                "Time series",
+                *export_plot_png(
+                    ts_fig, export_folder, channel, w_start, w_end, "timeseries"
+                ),
+            )
+        )
+
+        raw_f, raw_m = compute_fft_for_channel(w_export, channel, sampling_rate)
+        fft_f, fft_m = mask_band(raw_f, raw_m, fft_low, fft_high)
+        fft_fig = plot_fft(fft_f, fft_m, channel, fft_low, fft_high)
+        export_results.append(
+            (
+                "FFT",
+                *export_plot_png(
+                    fft_fig, export_folder, channel, w_start, w_end, "fft"
+                ),
+            )
+        )
+
+        dist_fig = plot_distribution(w_export, channel)
+        export_results.append(
+            (
+                "Distribution",
+                *export_plot_png(
+                    dist_fig, export_folder, channel, w_start, w_end, "distribution"
+                ),
+            )
+        )
+
+        shape_f, shape_m = mask_band(raw_f, raw_m, shape_band_low, shape_band_high)
+        peak_f, peak_m = bin_peaks_by_frequency(shape_f, shape_m, peak_bin_hz)
+        if len(peak_f) >= 5:
+            shape_fig = plot_peak_envelope_on_fft(
+                shape_f,
+                shape_m,
+                peak_f,
+                peak_m,
+                channel,
+                shape_band_low,
+                shape_band_high,
+                peak_bin_hz,
+            )
+            export_results.append(
+                (
+                    "Peak-envelope/shape",
+                    *export_plot_png(
+                        shape_fig, export_folder, channel, w_start, w_end, "shape"
+                    ),
+                )
+            )
+        else:
+            export_results.append(
+                (
+                    "Peak-envelope/shape",
+                    False,
+                    "Skipped — not enough bins in the shape band for this window",
+                )
+            )
+
+        st.session_state.last_export_results = export_results
+        st.session_state.last_export_time = datetime.now()
+
     st.session_state.window_start = window_end
 
 # ---------------------------------------------------------------------------
@@ -581,6 +709,14 @@ st.title("Sensor Stream Monitor")
 st.caption(
     f"Channel: **{channel}** · Window: **{window_seconds}s** · Nominal sampling: **{sampling_rate} Hz**"
 )
+
+if st.session_state.last_export_results is not None:
+    n_ok = sum(1 for _, ok, _ in st.session_state.last_export_results if ok)
+    n_total = len(st.session_state.last_export_results)
+    label = f"Last auto-export — {st.session_state.last_export_time.strftime('%Y-%m-%d %H:%M:%S')} ({n_ok}/{n_total} succeeded)"
+    with st.expander(label, expanded=(n_ok < n_total)):
+        for name, ok, msg in st.session_state.last_export_results:
+            st.caption(f"{'✅' if ok else '❌'} {name} → {msg}")
 
 w = st.session_state.current_window
 if w is not None and not w.empty:
