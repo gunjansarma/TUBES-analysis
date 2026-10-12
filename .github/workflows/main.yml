@@ -26,11 +26,14 @@ jobs:
           pyinstaller --onedir --name SensorStreamMonitor
           --collect-all streamlit
           --collect-all plotly
+          --collect-all scipy
+          --collect-all kaleido
           --copy-metadata streamlit
           --copy-metadata pandas
           --copy-metadata numpy
           --copy-metadata scipy
           --copy-metadata plotly
+          --copy-metadata kaleido
           --add-data "app.py;."
           --noconfirm
           launcher.py
