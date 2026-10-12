@@ -30,6 +30,7 @@ jobs:
           --collect-all streamlit
           --collect-all plotly
           --collect-all kaleido
+          --collect-all scipy
           --copy-metadata streamlit
           --copy-metadata pandas
           --copy-metadata numpy
