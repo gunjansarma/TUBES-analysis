@@ -37,26 +37,53 @@ from scipy.fft import fft, fftfreq
 from scipy.signal import find_peaks, savgol_filter
 from scipy.stats import gaussian_kde, kurtosis, skew
 
-COLUMNS = [
-    "Time",
-    "SPEED",
-    "POWER",
-    "FREQUENCY",
-    "VOLTAGE",
-    "CURRENT1",
-    "CURRENT2",
-    "Column8",
-    "Column9",
-]
+COLUMNS = ["Time", "SPEED", "POWER", "FREQUENCY", "VOLTAGE",
+           "CURRENT1", "CURRENT2", "Column8", "Column9"]
 ANALYZABLE_CHANNELS = ["SPEED", "POWER", "FREQUENCY", "VOLTAGE", "CURRENT1", "CURRENT2"]
 
-MAX_TIMESERIES_POINTS = 5000  # downsample for plotting only, not for stats/FFT
-MAX_DIST_POINTS = 20000  # KDE gets slow well before 300k points
+MAX_TIMESERIES_POINTS = 5000   # downsample for plotting only, not for stats/FFT
+MAX_DIST_POINTS = 20000        # KDE gets slow well before 300k points
 
 
 # ---------------------------------------------------------------------------
 # Ingestion
 # ---------------------------------------------------------------------------
+def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Force every column of `df` back to a proper numeric dtype.
+
+    Why this exists: `st.session_state.buffer` and `manual_df` both start life as an
+    EMPTY, untyped DataFrame (`pd.DataFrame(columns=COLUMNS)` — pandas has no data to
+    infer a dtype from, so every column defaults to 'object'). Every poll concatenates
+    real, already-numeric rows onto that buffer with `pd.concat`, and pandas can
+    silently upcast the *result* back to 'object' dtype when one side of the concat
+    started out untyped. Object dtype passes almost every pandas operation without
+    complaint — but numpy's ufuncs (np.isfinite among them, used in compute_metrics()
+    and plot_distribution()) refuse to run on it, raising exactly the
+    "ufunc 'isfinite' not supported for the input types" crash this app was throwing.
+    Calling this right after every concat keeps state from ever drifting back into
+    object dtype, instead of just patching the symptom at read time."""
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def find_latest_txt_file(folder: str) -> str | None:
+    """Return the full path of the most recently MODIFIED .txt file directly inside
+    `folder` (subfolders are not searched), or None if the folder doesn't exist or
+    holds no .txt files yet. 'Most recent' is judged by filesystem modification time,
+    not filename — so this works whether the acquisition software timestamps its
+    filenames or not."""
+    if not folder or not os.path.isdir(folder):
+        return None
+    candidates = [
+        os.path.join(folder, name) for name in os.listdir(folder)
+        if name.lower().endswith(".txt") and os.path.isfile(os.path.join(folder, name))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
 def read_new_rows(path: str, offset: int) -> tuple[pd.DataFrame, int]:
     """Read only newly-appended, COMPLETE lines from `path` starting at byte `offset`.
     Returns (new_rows_df, new_offset). Leaves a trailing partial line unread."""
@@ -87,9 +114,7 @@ def read_new_rows(path: str, offset: int) -> tuple[pd.DataFrame, int]:
         return pd.DataFrame(columns=COLUMNS), new_offset
 
     try:
-        new_df = pd.read_csv(
-            StringIO("\n".join(lines)), sep="\t", header=None, engine="python"
-        )
+        new_df = pd.read_csv(StringIO("\n".join(lines)), sep="\t", header=None, engine="python")
     except Exception:
         return pd.DataFrame(columns=COLUMNS), new_offset
 
@@ -123,22 +148,10 @@ def plot_timeseries(df: pd.DataFrame, col: str) -> go.Figure:
         step = len(d) // MAX_TIMESERIES_POINTS
         d = d.iloc[::step]
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=d["Time"],
-            y=d[col],
-            mode="lines",
-            line=dict(color="#3366cc", width=1.5),
-            name=col,
-        )
-    )
-    fig.update_layout(
-        title=f"{col} — Time Series",
-        xaxis_title="Time (s)",
-        yaxis_title=col,
-        height=340,
-        margin=dict(t=40, b=30),
-    )
+    fig.add_trace(go.Scatter(x=d["Time"], y=d[col], mode="lines",
+                              line=dict(color="#3366cc", width=1.5), name=col))
+    fig.update_layout(title=f"{col} — Time Series", xaxis_title="Time (s)",
+                       yaxis_title=col, height=340, margin=dict(t=40, b=30))
     return fig
 
 
@@ -152,9 +165,7 @@ def compute_fft(values: np.ndarray, sampling_rate: float):
     return pos, mag
 
 
-def get_fft_band(
-    df: pd.DataFrame, col: str, sampling_rate: float, low: float, high: float
-):
+def get_fft_band(df: pd.DataFrame, col: str, sampling_rate: float, low: float, high: float):
     """FFT of the channel, masked to [low, high] Hz — the exact data the FFT plot shows,
     reused for the diagnostics below it so the FFT isn't computed twice."""
     values = df[col].dropna().values
@@ -165,8 +176,7 @@ def get_fft_band(
 
 def compute_fft_for_channel(df: pd.DataFrame, col: str, sampling_rate: float):
     """Raw (unmasked) FFT of the channel, so multiple bands (main plot band, shape-analysis
-    band) can be sliced from it via mask_band() without recomputing the FFT each time.
-    """
+    band) can be sliced from it via mask_band() without recomputing the FFT each time."""
     values = df[col].dropna().values
     return compute_fft(values, sampling_rate)
 
@@ -179,26 +189,17 @@ def mask_band(freqs: np.ndarray, mags: np.ndarray, low: float, high: float):
     return freqs[mask], mags[mask]
 
 
-def plot_fft(
-    freqs: np.ndarray, mags: np.ndarray, col: str, low: float, high: float
-) -> go.Figure:
+def plot_fft(freqs: np.ndarray, mags: np.ndarray, col: str, low: float, high: float) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(x=freqs, y=mags, mode="lines", line=dict(color="#cc3366", width=1.5))
-    )
-    fig.update_layout(
-        title=f"FFT of {col} ({low:.0f}–{high:.0f} Hz)",
-        xaxis_title="Frequency (Hz)",
-        yaxis_title="Magnitude",
-        height=340,
-        margin=dict(t=40, b=30),
-    )
+    fig.add_trace(go.Scatter(x=freqs, y=mags, mode="lines",
+                              line=dict(color="#cc3366", width=1.5)))
+    fig.update_layout(title=f"FFT of {col} ({low:.0f}–{high:.0f} Hz)",
+                       xaxis_title="Frequency (Hz)", yaxis_title="Magnitude",
+                       height=340, margin=dict(t=40, b=30))
     return fig
 
 
-def compute_fft_diagnostics(
-    freqs: np.ndarray, mags: np.ndarray, peak_prominence_frac: float
-) -> dict:
+def compute_fft_diagnostics(freqs: np.ndarray, mags: np.ndarray, peak_prominence_frac: float) -> dict:
     """Spectral entropy, peak-to-noise ratio, envelope smoothness, and harmonic spacing
     variance — all computed on the same masked band the FFT plot shows."""
     result = {
@@ -211,7 +212,7 @@ def compute_fft_diagnostics(
         return result
 
     # Spectral entropy: normalized Shannon entropy of the power distribution.
-    power = mags**2
+    power = mags ** 2
     total = power.sum()
     if total > 0:
         p = power / total
@@ -231,9 +232,7 @@ def compute_fft_diagnostics(
     if window >= 5 and mags.std() > 0:
         trend = savgol_filter(mags, window_length=window, polyorder=3)
         residual = mags - trend
-        result["Envelope Smoothness"] = float(
-            np.clip(1 - residual.std() / mags.std(), 0, 1)
-        )
+        result["Envelope Smoothness"] = float(np.clip(1 - residual.std() / mags.std(), 0, 1))
 
     # Harmonic spacing variance: variance of the frequency gaps between detected peaks.
     if peak > 0:
@@ -270,37 +269,17 @@ def bin_peaks_by_frequency(freqs: np.ndarray, mags: np.ndarray, bin_hz: float):
     return np.array(bin_freqs), np.array(bin_mags)
 
 
-def plot_peak_envelope_on_fft(
-    base_freqs, base_mags, peak_freqs, peak_mags, col, low, high, bin_hz
-) -> go.Figure:
+def plot_peak_envelope_on_fft(base_freqs, base_mags, peak_freqs, peak_mags, col, low, high, bin_hz) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=base_freqs,
-            y=base_mags,
-            mode="lines",
-            line=dict(color="rgba(204,51,102,0.25)", width=1),
-            name="Full-window FFT (300s, unbinned)",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=peak_freqs,
-            y=peak_mags,
-            mode="lines+markers",
-            line=dict(color="#cc3366", width=2),
-            marker=dict(size=6),
-            name=f"Peak per {bin_hz:g} Hz bin, connected",
-        )
-    )
-    fig.update_layout(
-        title=f"FFT of {col} ({low:.0f}–{high:.0f} Hz) — {bin_hz:g} Hz peak envelope",
-        xaxis_title="Frequency (Hz)",
-        yaxis_title="Magnitude",
-        height=380,
-        margin=dict(t=40, b=30),
-        legend=dict(orientation="h", y=-0.2),
-    )
+    fig.add_trace(go.Scatter(x=base_freqs, y=base_mags, mode="lines",
+                              line=dict(color="rgba(204,51,102,0.25)", width=1),
+                              name="Full-window FFT (300s, unbinned)"))
+    fig.add_trace(go.Scatter(x=peak_freqs, y=peak_mags, mode="lines+markers",
+                              line=dict(color="#cc3366", width=2), marker=dict(size=6),
+                              name=f"Peak per {bin_hz:g} Hz bin, connected"))
+    fig.update_layout(title=f"FFT of {col} ({low:.0f}–{high:.0f} Hz) — {bin_hz:g} Hz peak envelope",
+                       xaxis_title="Frequency (Hz)", yaxis_title="Magnitude",
+                       height=380, margin=dict(t=40, b=30), legend=dict(orientation="h", y=-0.2))
     return fig
 
 
@@ -323,9 +302,7 @@ def classify_curve_shape(x: np.ndarray, y: np.ndarray, r2_threshold: float) -> d
 
     r2_quad = 1 - np.sum((y - quad_pred) ** 2) / ss_tot
     result["r2_quadratic"] = float(r2_quad)
-    result["concavity"] = (
-        "downward (rise then fall)" if quad_coeffs[0] < 0 else "upward (dip then rise)"
-    )
+    result["concavity"] = "downward (rise then fall)" if quad_coeffs[0] < 0 else "upward (dip then rise)"
 
     result["label"] = "Parabolic" if r2_quad >= r2_threshold else "No clear shape"
     return result
@@ -338,63 +315,29 @@ def plot_distribution(df: pd.DataFrame, col: str) -> go.Figure:
         data = data.sample(MAX_DIST_POINTS, random_state=0)
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Histogram(
-            x=data,
-            histnorm="probability density",
-            marker_color="#2ca02c",
-            opacity=0.5,
-            name="Histogram",
-        )
-    )
+    fig.add_trace(go.Histogram(x=data, histnorm="probability density",
+                                marker_color="#2ca02c", opacity=0.5, name="Histogram"))
 
     if len(data) > 2 and data.std() > 0:
         kde = gaussian_kde(data)
         x_grid = np.linspace(data.min(), data.max(), 200)
-        fig.add_trace(
-            go.Scatter(
-                x=x_grid,
-                y=kde(x_grid),
-                mode="lines",
-                line=dict(color="#1b7a1b", width=2),
-                name="KDE",
-            )
-        )
+        fig.add_trace(go.Scatter(x=x_grid, y=kde(x_grid), mode="lines",
+                                  line=dict(color="#1b7a1b", width=2), name="KDE"))
 
     mean, median = data.mean(), data.median()
-    fig.add_vline(
-        x=mean,
-        line_color="black",
-        annotation_text=f"Mean={mean:.3f}",
-        annotation_position="top",
-    )
-    fig.add_vline(
-        x=median,
-        line_dash="dash",
-        line_color="purple",
-        annotation_text=f"Median={median:.3f}",
-        annotation_position="bottom",
-    )
+    fig.add_vline(x=mean, line_color="black",
+                  annotation_text=f"Mean={mean:.3f}", annotation_position="top")
+    fig.add_vline(x=median, line_dash="dash", line_color="purple",
+                  annotation_text=f"Median={median:.3f}", annotation_position="bottom")
 
-    fig.update_layout(
-        title=f"Distribution of {col}",
-        height=340,
-        margin=dict(t=40, b=30),
-        showlegend=False,
-        xaxis_title=col,
-        yaxis_title="Density",
-    )
+    fig.update_layout(title=f"Distribution of {col}", height=340,
+                       margin=dict(t=40, b=30), showlegend=False,
+                       xaxis_title=col, yaxis_title="Density")
     return fig
 
 
-def export_plot_png(
-    fig: go.Figure,
-    folder: str,
-    channel: str,
-    window_start: float,
-    window_end: float,
-    plot_name: str,
-) -> tuple[bool, str]:
+def export_plot_png(fig: go.Figure, folder: str, channel: str, window_start: float,
+                     window_end: float, plot_name: str) -> tuple[bool, str]:
     """Write one Plotly figure to <folder> as a PNG. Filename = real-world export time
     (what you asked for) + the window's elapsed-second range (so exports from different
     windows don't collide or look identical — the Time column itself has no real calendar
@@ -406,18 +349,14 @@ def export_plot_png(
         return False, f"Could not create/access folder '{folder}': {e}"
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = (
-        f"{timestamp}_{channel}_{window_start:.0f}-{window_end:.0f}s_{plot_name}.png"
-    )
+    filename = f"{timestamp}_{channel}_{window_start:.0f}-{window_end:.0f}s_{plot_name}.png"
     full_path = os.path.join(folder, filename)
     try:
         fig.write_image(full_path, format="png", width=1200, height=700, scale=2)
         return True, full_path
     except Exception as e:
-        return False, (
-            f"PNG export failed ({e}). This usually means the 'kaleido' package "
-            f"isn't installed — run: pip install kaleido"
-        )
+        return False, (f"PNG export failed ({e}). This usually means the 'kaleido' package "
+                        f"isn't installed — run: pip install kaleido")
 
 
 def segment_into_windows(df: pd.DataFrame, window_seconds: float):
@@ -477,31 +416,6 @@ def fetch_url_text(url: str, timeout: float = 15.0) -> tuple[str, str]:
         return "", f"Fetch failed: {e}"
 
 
-def read_new_rows_from_url(
-    url: str, has_header_rows: bool, last_max_time: float
-) -> tuple[pd.DataFrame, float, str]:
-    """Poll `url` once, parse the response, and return only rows with Time > last_max_time.
-    Works whether the endpoint returns the full growing dataset on every call or only the
-    newest chunk — either way nothing gets double-counted, since the watermark is the data's
-    own Time column rather than a byte offset (which HTTP has no equivalent of).
-    Returns (new_rows_df, updated_max_time, error_message)."""
-    text, err = fetch_url_text(url)
-    if err:
-        return pd.DataFrame(columns=COLUMNS), last_max_time, err
-
-    parsed = parse_tabular_text(text, has_header_rows)
-    if parsed.empty or "Time" not in parsed.columns:
-        return pd.DataFrame(columns=COLUMNS), last_max_time, ""
-
-    parsed = parsed.dropna(subset=["Time"])
-    new_rows = parsed[parsed["Time"] > last_max_time]
-    if new_rows.empty:
-        return pd.DataFrame(columns=COLUMNS), last_max_time, ""
-
-    updated_max_time = max(last_max_time, new_rows["Time"].max())
-    return new_rows, updated_max_time, ""
-
-
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -509,52 +423,44 @@ st.set_page_config(page_title="Sensor Stream Monitor", layout="wide")
 
 st.sidebar.header("Configuration")
 live_source_mode = st.sidebar.radio(
-    "Live data source", ["Local file", "URL (polled)"], horizontal=True, index=1
+    "Live data source",
+    ["Single file", "Folder (watch for newest .txt)"],
+    horizontal=True,
+    index=1,
 )
-if live_source_mode == "Local file":
+if live_source_mode == "Single file":
     file_path = st.sidebar.text_input(
         "Log file path",
-        value="/content/drive/MyDrive/Tube-making_analysis/09_57_37.txt",
+        value=r"C:\Users\<you>\Desktop\WeldLogs\09_57_37.txt",
     )
-    live_url = None
-    live_url_has_header = False
+    folder_path = None
 else:
     file_path = None
-    live_url = st.sidebar.text_input(
-        "Live data URL", placeholder="https://example.com/latest-data"
-    )
-    live_url_has_header = st.sidebar.checkbox(
-        "Response starts with the 2 header rows", value=False
+    folder_path = st.sidebar.text_input(
+        "Folder to watch",
+        placeholder=r"C:\Users\<you>\Desktop\WeldLogs",
     )
     st.sidebar.caption(
-        "Polled every 'Poll interval' below. Only rows with Time greater than what's "
-        "already been ingested are kept — safe whether the endpoint returns the full "
-        "dataset or just the newest chunk each time."
+        "Checked every 'Poll interval' below. The app reads whichever .txt file in this "
+        "folder was modified most recently, and switches to a newer one automatically the "
+        "moment it shows up — each file's completed windows are analyzed and added to the "
+        "history log below in turn. A file that's replaced before it reaches a full window "
+        "is dropped, not analyzed."
     )
 sampling_rate = st.sidebar.number_input("Sampling rate (Hz)", value=1000, min_value=1)
 window_seconds = st.sidebar.number_input("Window length (s)", value=300, min_value=1)
 fft_low = st.sidebar.number_input("FFT band low (Hz)", value=100.0)
 fft_high = st.sidebar.number_input("FFT band high (Hz)", value=150.0)
-peak_bin_hz = st.sidebar.number_input(
-    "Peak-envelope bin width (Hz)", value=1.0, min_value=0.1, step=0.5
-)
-shape_r2_threshold = st.sidebar.slider(
-    "Parabola shape fit threshold (R²)", 0.30, 0.95, 0.70, step=0.05
-)
+peak_bin_hz = st.sidebar.number_input("Peak-envelope bin width (Hz)", value=1.0, min_value=0.1, step=0.5)
+shape_r2_threshold = st.sidebar.slider("Parabola shape fit threshold (R²)", 0.30, 0.95, 0.70, step=0.05)
 st.sidebar.caption("Shape classification band (independent of the FFT band above):")
 shape_band_low = st.sidebar.number_input("Shape band low (Hz)", value=100.0)
 shape_band_high = st.sidebar.number_input("Shape band high (Hz)", value=120.0)
-require_inverted = st.sidebar.checkbox(
-    "Only count downward/inverted parabola as 'good weld'", value=True
-)
-peak_prominence_pct = st.sidebar.slider(
-    "Harmonic peak prominence (% of peak)", 1, 50, 10
-)
+require_inverted = st.sidebar.checkbox("Only count downward/inverted parabola as 'good weld'", value=True)
+peak_prominence_pct = st.sidebar.slider("Harmonic peak prominence (% of peak)", 1, 50, 10)
 poll_seconds = st.sidebar.number_input("Poll interval (s)", value=3, min_value=1)
 auto_refresh = st.sidebar.checkbox("Auto-poll for new data", value=True)
-channel = st.sidebar.selectbox(
-    "Channel to analyze", ANALYZABLE_CHANNELS, index=1
-)  # default POWER
+channel = st.sidebar.selectbox("Channel to analyze", ANALYZABLE_CHANNELS, index=1)  # default POWER
 
 st.sidebar.divider()
 st.sidebar.subheader("Plot Export")
@@ -575,24 +481,23 @@ st.sidebar.caption(
 if export_enabled and not export_folder.strip():
     st.sidebar.warning("Enter a folder path above, or exports will be skipped.")
 
-reset_label = (
-    "Reset stream (re-read file from byte 0)"
-    if live_source_mode == "Local file"
-    else "Reset stream (re-fetch URL from scratch)"
-)
+reset_label = ("Reset stream (re-read file from byte 0)" if live_source_mode == "Single file"
+               else "Reset stream (clear history, watch from scratch)")
 if st.sidebar.button(reset_label):
     st.session_state.byte_offset = 0
-    st.session_state.url_last_max_time = -1.0
     st.session_state.buffer = pd.DataFrame(columns=COLUMNS)
     st.session_state.window_start = 0.0
     st.session_state.current_window = None
+    st.session_state.tracked_file = None
+    st.session_state.processed_log = []
 
 for key, default in [
     ("byte_offset", 0),
-    ("url_last_max_time", -1.0),
+    ("tracked_file", None),
     ("buffer", pd.DataFrame(columns=COLUMNS)),
     ("window_start", 0.0),
     ("current_window", None),
+    ("processed_log", []),
     ("manual_df", pd.DataFrame(columns=COLUMNS)),
     ("last_upload_sig", None),
     ("last_export_results", None),
@@ -601,21 +506,37 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
-# --- ingest whatever is new since last poll ---
+# --- in Folder mode, figure out which file we should be tailing this render ---
 live_fetch_error = ""
-if live_source_mode == "Local file":
-    new_df, st.session_state.byte_offset = read_new_rows(
-        file_path, st.session_state.byte_offset
-    )
+if live_source_mode == "Folder (watch for newest .txt)":
+    folder_clean = (folder_path or "").strip()
+    if not folder_clean:
+        live_fetch_error = "Enter a folder path above to start watching for files."
+    elif not os.path.isdir(folder_clean):
+        live_fetch_error = f"'{folder_clean}' is not a folder this machine can see."
+    else:
+        latest_file = find_latest_txt_file(folder_clean)
+        if latest_file is None:
+            live_fetch_error = f"No .txt files in '{folder_clean}' yet."
+        elif latest_file != st.session_state.tracked_file:
+            # A newer file has appeared (by modified time) — switch to it from byte 0.
+            # Any partial, sub-window data left in the buffer from the previous file is
+            # dropped here, not analyzed, since it never completed a full window.
+            st.session_state.tracked_file = latest_file
+            st.session_state.byte_offset = 0
+            st.session_state.buffer = pd.DataFrame(columns=COLUMNS)
+            st.session_state.window_start = 0.0
+            st.session_state.current_window = None
+    file_path = st.session_state.tracked_file
+
+# --- ingest whatever is new since last poll ---
+if file_path:
+    new_df, st.session_state.byte_offset = read_new_rows(file_path, st.session_state.byte_offset)
 else:
-    new_df, st.session_state.url_last_max_time, live_fetch_error = (
-        read_new_rows_from_url(
-            live_url, live_url_has_header, st.session_state.url_last_max_time
-        )
-    )
+    new_df = pd.DataFrame(columns=COLUMNS)
 if not new_df.empty:
-    st.session_state.buffer = pd.concat(
-        [st.session_state.buffer, new_df], ignore_index=True
+    st.session_state.buffer = _coerce_numeric(
+        pd.concat([st.session_state.buffer, new_df], ignore_index=True)
     )
 
 # --- advance the window if a full window_seconds span is now available ---
@@ -628,6 +549,31 @@ if window_ready:
     st.session_state.current_window = buf.loc[mask].copy()
     st.session_state.buffer = buf.loc[buf["Time"] >= window_end].copy()
 
+    # --- log this window's verdict, exactly once, the moment it completes — this is
+    # what builds the running history as the app works through a folder of files one
+    # by one (this block only runs on a window transition, not on every poll) ---
+    w_log = st.session_state.current_window
+    log_raw_f, log_raw_m = compute_fft_for_channel(w_log, channel, sampling_rate)
+    log_shape_f, log_shape_m = mask_band(log_raw_f, log_raw_m, shape_band_low, shape_band_high)
+    log_peak_f, log_peak_m = bin_peaks_by_frequency(log_shape_f, log_shape_m, peak_bin_hz)
+    if len(log_peak_f) >= 5:
+        log_shape = classify_curve_shape(log_peak_f, log_peak_m, shape_r2_threshold)
+    else:
+        log_shape = {"r2_quadratic": np.nan, "concavity": None, "label": "Not enough data"}
+    log_is_good = log_shape["label"] == "Parabolic" and (
+        not require_inverted or (log_shape["concavity"] or "").startswith("downward")
+    )
+    log_metrics = compute_metrics(w_log[channel])
+    st.session_state.processed_log.insert(0, {
+        "Analyzed at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Source file": os.path.basename(file_path) if file_path else "(unknown)",
+        "Window (s)": f"{w_log['Time'].min():.0f}–{w_log['Time'].max():.0f}",
+        "Channel": channel,
+        "Verdict": "Good weld (inverted parabola)" if log_is_good else log_shape["label"],
+        "R2": round(log_shape["r2_quadratic"], 3) if not np.isnan(log_shape["r2_quadratic"]) else None,
+        "Mean": round(log_metrics["Mean"], 3) if not np.isnan(log_metrics["Mean"]) else None,
+    })
+
     # --- auto-export, exactly once per completed window (this block only runs on a
     # window transition, not on every poll) — Manual Data Entry is untouched by design ---
     if export_enabled and export_folder.strip():
@@ -636,66 +582,29 @@ if window_ready:
         export_results = []
 
         ts_fig = plot_timeseries(w_export, channel)
-        export_results.append(
-            (
-                "Time series",
-                *export_plot_png(
-                    ts_fig, export_folder, channel, w_start, w_end, "timeseries"
-                ),
-            )
-        )
+        export_results.append(("Time series", *export_plot_png(
+            ts_fig, export_folder, channel, w_start, w_end, "timeseries")))
 
         raw_f, raw_m = compute_fft_for_channel(w_export, channel, sampling_rate)
         fft_f, fft_m = mask_band(raw_f, raw_m, fft_low, fft_high)
         fft_fig = plot_fft(fft_f, fft_m, channel, fft_low, fft_high)
-        export_results.append(
-            (
-                "FFT",
-                *export_plot_png(
-                    fft_fig, export_folder, channel, w_start, w_end, "fft"
-                ),
-            )
-        )
+        export_results.append(("FFT", *export_plot_png(
+            fft_fig, export_folder, channel, w_start, w_end, "fft")))
 
         dist_fig = plot_distribution(w_export, channel)
-        export_results.append(
-            (
-                "Distribution",
-                *export_plot_png(
-                    dist_fig, export_folder, channel, w_start, w_end, "distribution"
-                ),
-            )
-        )
+        export_results.append(("Distribution", *export_plot_png(
+            dist_fig, export_folder, channel, w_start, w_end, "distribution")))
 
         shape_f, shape_m = mask_band(raw_f, raw_m, shape_band_low, shape_band_high)
         peak_f, peak_m = bin_peaks_by_frequency(shape_f, shape_m, peak_bin_hz)
         if len(peak_f) >= 5:
             shape_fig = plot_peak_envelope_on_fft(
-                shape_f,
-                shape_m,
-                peak_f,
-                peak_m,
-                channel,
-                shape_band_low,
-                shape_band_high,
-                peak_bin_hz,
-            )
-            export_results.append(
-                (
-                    "Peak-envelope/shape",
-                    *export_plot_png(
-                        shape_fig, export_folder, channel, w_start, w_end, "shape"
-                    ),
-                )
-            )
+                shape_f, shape_m, peak_f, peak_m, channel, shape_band_low, shape_band_high, peak_bin_hz)
+            export_results.append(("Peak-envelope/shape", *export_plot_png(
+                shape_fig, export_folder, channel, w_start, w_end, "shape")))
         else:
-            export_results.append(
-                (
-                    "Peak-envelope/shape",
-                    False,
-                    "Skipped — not enough bins in the shape band for this window",
-                )
-            )
+            export_results.append(("Peak-envelope/shape", False,
+                                    "Skipped — not enough bins in the shape band for this window"))
 
         st.session_state.last_export_results = export_results
         st.session_state.last_export_time = datetime.now()
@@ -706,9 +615,20 @@ if window_ready:
 # Render
 # ---------------------------------------------------------------------------
 st.title("Sensor Stream Monitor")
-st.caption(
-    f"Channel: **{channel}** · Window: **{window_seconds}s** · Nominal sampling: **{sampling_rate} Hz**"
-)
+st.caption(f"Channel: **{channel}** · Window: **{window_seconds}s** · Nominal sampling: **{sampling_rate} Hz**")
+
+if st.session_state.processed_log:
+    st.subheader("Processed Windows (history)")
+    st.caption("Every completed window, newest first — across every file this session has worked through.")
+    hist_df = pd.DataFrame(st.session_state.processed_log)
+    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download history as CSV",
+        data=hist_df.to_csv(index=False).encode(),
+        file_name="processed_windows_history.csv",
+        mime="text/csv",
+    )
+    st.divider()
 
 if st.session_state.last_export_results is not None:
     n_ok = sum(1 for _, ok, _ in st.session_state.last_export_results if ok)
@@ -720,9 +640,7 @@ if st.session_state.last_export_results is not None:
 
 w = st.session_state.current_window
 if w is not None and not w.empty:
-    st.subheader(
-        f"Window {w['Time'].min():.1f}s – {w['Time'].max():.1f}s  ({len(w):,} rows)"
-    )
+    st.subheader(f"Window {w['Time'].min():.1f}s – {w['Time'].max():.1f}s  ({len(w):,} rows)")
 
     st.plotly_chart(plot_timeseries(w, channel), use_container_width=True)
 
@@ -730,87 +648,69 @@ if w is not None and not w.empty:
     fft_freqs, fft_mags = mask_band(raw_freqs, raw_mags, fft_low, fft_high)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(
-            plot_fft(fft_freqs, fft_mags, channel, fft_low, fft_high),
-            use_container_width=True,
-        )
+        st.plotly_chart(plot_fft(fft_freqs, fft_mags, channel, fft_low, fft_high), use_container_width=True)
     with c2:
-        st.plotly_chart(plot_distribution(w, channel), use_container_width=True)
+        # Isolated: a crash here (bad dtype, all-NaN channel, etc.) must not take the
+        # shape-classification and metrics panels below it down with it.
+        try:
+            st.plotly_chart(plot_distribution(w, channel), use_container_width=True)
+        except Exception as e:
+            st.error(f"Distribution plot failed: {e}")
 
     st.subheader("FFT Diagnostics")
-    fft_diag = compute_fft_diagnostics(fft_freqs, fft_mags, peak_prominence_pct / 100)
-    fcols = st.columns(4)
-    for i, (k, v) in enumerate(fft_diag.items()):
-        display = "N/A" if (v is None or np.isnan(v)) else f"{v:,.4f}"
-        fcols[i % 4].metric(k, display)
+    try:
+        fft_diag = compute_fft_diagnostics(fft_freqs, fft_mags, peak_prominence_pct / 100)
+        fcols = st.columns(4)
+        for i, (k, v) in enumerate(fft_diag.items()):
+            display = "N/A" if (v is None or np.isnan(v)) else f"{v:,.4f}"
+            fcols[i % 4].metric(k, display)
+    except Exception as e:
+        st.error(f"FFT diagnostics failed: {e}")
 
     st.subheader("Peak Envelope & Shape Classification")
-    st.caption(
-        f"Scoped to {shape_band_low:g}–{shape_band_high:g} Hz — independent of the {fft_low:g}–{fft_high:g} Hz FFT band above."
-    )
-    shape_freqs, shape_mags = mask_band(
-        raw_freqs, raw_mags, shape_band_low, shape_band_high
-    )
-    peak_freqs, peak_mags = bin_peaks_by_frequency(shape_freqs, shape_mags, peak_bin_hz)
-    if len(peak_freqs) < 5:
-        st.info(
-            "Not enough bins in the shape band for analysis — widen the shape band or shrink the bin width."
-        )
-    else:
-        st.plotly_chart(
-            plot_peak_envelope_on_fft(
-                shape_freqs,
-                shape_mags,
-                peak_freqs,
-                peak_mags,
-                channel,
-                shape_band_low,
-                shape_band_high,
-                peak_bin_hz,
-            ),
-            use_container_width=True,
-        )
-        shape = classify_curve_shape(peak_freqs, peak_mags, shape_r2_threshold)
-        is_good = shape["label"] == "Parabolic" and (
-            not require_inverted or (shape["concavity"] or "").startswith("downward")
-        )
-        scols = st.columns(3)
-        scols[0].metric(
-            "R² (quadratic fit)",
-            (
-                f"{shape['r2_quadratic']:.3f}"
-                if not np.isnan(shape["r2_quadratic"])
-                else "N/A"
-            ),
-        )
-        scols[1].metric("Concavity", shape["concavity"] or "N/A")
-        scols[2].metric("Shape", "Inverted parabola" if is_good else shape["label"])
-        if is_good:
-            st.success(
-                f"Shape: inverted parabola ({shape['concavity']}) → heuristic reads as **possible good weld**."
-            )
-        elif shape["label"] == "No clear shape":
-            st.warning(
-                "Shape: no clear fit → heuristic reads as **possible bad weld**."
-            )
-        elif shape["label"] == "Parabolic":
-            st.info(
-                f"Shape: parabolic, but {shape['concavity']} — not inverted, so it doesn't satisfy the good-weld rule as specified."
-            )
+    st.caption(f"Scoped to {shape_band_low:g}–{shape_band_high:g} Hz — independent of the {fft_low:g}–{fft_high:g} Hz FFT band above.")
+    try:
+        shape_freqs, shape_mags = mask_band(raw_freqs, raw_mags, shape_band_low, shape_band_high)
+        peak_freqs, peak_mags = bin_peaks_by_frequency(shape_freqs, shape_mags, peak_bin_hz)
+        if len(peak_freqs) < 5:
+            st.info("Not enough bins in the shape band for analysis — widen the shape band or shrink the bin width.")
         else:
-            st.info(f"Shape: {shape['label']} — doesn't match the good-weld rule.")
-        st.caption(
-            "⚠️ Inverted-parabola-equals-good-weld is a heuristic rule you specified, not something "
-            "validated against known weld outcomes here. Check it against a batch of welds with "
-            "**confirmed** good/bad results before using this as an actual accept/reject gate."
-        )
+            st.plotly_chart(
+                plot_peak_envelope_on_fft(shape_freqs, shape_mags, peak_freqs, peak_mags, channel,
+                                           shape_band_low, shape_band_high, peak_bin_hz),
+                use_container_width=True,
+            )
+            shape = classify_curve_shape(peak_freqs, peak_mags, shape_r2_threshold)
+            is_good = shape["label"] == "Parabolic" and (not require_inverted or (shape["concavity"] or "").startswith("downward"))
+            scols = st.columns(3)
+            scols[0].metric("R² (quadratic fit)", f"{shape['r2_quadratic']:.3f}" if not np.isnan(shape['r2_quadratic']) else "N/A")
+            scols[1].metric("Concavity", shape["concavity"] or "N/A")
+            scols[2].metric("Shape", "Inverted parabola" if is_good else shape["label"])
+            if is_good:
+                st.success(f"Shape: inverted parabola ({shape['concavity']}) → heuristic reads as **possible good weld**.")
+            elif shape["label"] == "No clear shape":
+                st.warning("Shape: no clear fit → heuristic reads as **possible bad weld**.")
+            elif shape["label"] == "Parabolic":
+                st.info(f"Shape: parabolic, but {shape['concavity']} — not inverted, so it doesn't satisfy the good-weld rule as specified.")
+            else:
+                st.info(f"Shape: {shape['label']} — doesn't match the good-weld rule.")
+            st.caption(
+                "⚠️ Inverted-parabola-equals-good-weld is a heuristic rule you specified, not something "
+                "validated against known weld outcomes here. Check it against a batch of welds with "
+                "**confirmed** good/bad results before using this as an actual accept/reject gate."
+            )
+    except Exception as e:
+        st.error(f"Shape classification failed: {e}")
 
     st.subheader("Time-Series Metrics")
-    metrics = compute_metrics(w[channel])
-    cols = st.columns(4)
-    for i, (k, v) in enumerate(metrics.items()):
-        display = f"{v:,.4f}" if isinstance(v, (float, np.floating)) else f"{v}"
-        cols[i % 4].metric(k, display)
+    try:
+        metrics = compute_metrics(w[channel])
+        cols = st.columns(4)
+        for i, (k, v) in enumerate(metrics.items()):
+            display = f"{v:,.4f}" if isinstance(v, (float, np.floating)) else f"{v}"
+            cols[i % 4].metric(k, display)
+    except Exception as e:
+        st.error(f"Metrics failed: {e}")
 
     st.download_button(
         "Download this window as CSV",
@@ -828,20 +728,16 @@ else:
     )
 
 if live_fetch_error:
-    st.error(
-        f"Last poll of the URL failed: {live_fetch_error} (will retry next poll in {poll_seconds}s)"
-    )
+    st.error(f"{live_fetch_error} (will check again in {poll_seconds}s)")
 
-if live_source_mode == "Local file":
-    st.caption(
-        f"File offset read so far: {st.session_state.byte_offset:,} bytes · polling every {poll_seconds}s"
-    )
+if live_source_mode == "Single file":
+    st.caption(f"File offset read so far: {st.session_state.byte_offset:,} bytes · polling every {poll_seconds}s")
 else:
-    watermark = st.session_state.url_last_max_time
-    watermark_display = "none yet" if watermark < 0 else f"{watermark:.3f}s"
-    st.caption(
-        f"Latest Time ingested from URL: {watermark_display} · polling every {poll_seconds}s"
-    )
+    tracked = st.session_state.tracked_file
+    tracked_display = os.path.basename(tracked) if tracked else "none yet"
+    st.caption(f"Watching: **{folder_path or '(no folder set)'}** · currently reading: "
+               f"**{tracked_display}** · offset {st.session_state.byte_offset:,} bytes · "
+               f"checking every {poll_seconds}s")
 
 st.divider()
 
@@ -861,21 +757,17 @@ st.caption(
 mc1, mc2, mc3 = st.columns(3)
 
 with mc1:
-    uploaded = st.file_uploader(
-        "Upload a file (.txt/.csv, same format as the log file)", type=["txt", "csv"]
-    )
-    has_header = st.checkbox(
-        "File starts with the 2 header rows (same as the log format)", value=True
-    )
+    uploaded = st.file_uploader("Upload a file (.txt/.csv, same format as the log file)", type=["txt", "csv"])
+    has_header = st.checkbox("File starts with the 2 header rows (same as the log format)", value=True)
     if uploaded is not None:
         sig = (uploaded.name, uploaded.size)
         if sig != st.session_state.last_upload_sig:
             text = uploaded.getvalue().decode(errors="replace")
             parsed = parse_tabular_text(text, has_header)
             if not parsed.empty:
-                st.session_state.manual_df = pd.concat(
+                st.session_state.manual_df = _coerce_numeric(pd.concat(
                     [st.session_state.manual_df, parsed], ignore_index=True
-                )
+                ))
                 st.session_state.last_upload_sig = sig
                 st.success(f"Added {len(parsed):,} rows from {uploaded.name}.")
 
@@ -889,9 +781,9 @@ with mc2:
         if pasted.strip():
             parsed = parse_tabular_text(pasted, has_header_rows=False)
             if not parsed.empty:
-                st.session_state.manual_df = pd.concat(
+                st.session_state.manual_df = _coerce_numeric(pd.concat(
                     [st.session_state.manual_df, parsed], ignore_index=True
-                )
+                ))
                 st.success(f"Added {len(parsed):,} rows from pasted text.")
         else:
             st.warning("Nothing to add — the box is empty.")
@@ -901,9 +793,7 @@ with mc3:
         "...or fetch from a link (HTTP/HTTPS, returns the same tab-separated data)",
         placeholder="https://example.com/latest-data",
     )
-    link_has_header = st.checkbox(
-        "Link response starts with the 2 header rows", value=False
-    )
+    link_has_header = st.checkbox("Link response starts with the 2 header rows", value=False)
     if st.button("Fetch from link"):
         text, err = fetch_url_text(link_url)
         if err:
@@ -911,18 +801,14 @@ with mc3:
         else:
             parsed = parse_tabular_text(text, link_has_header)
             if parsed.empty:
-                st.warning(
-                    "Fetched the link, but got 0 parseable rows — check the response format "
-                    "matches tab-separated Time/SPEED/POWER/... and the header-rows checkbox above."
-                )
+                st.warning("Fetched the link, but got 0 parseable rows — check the response format "
+                            "matches tab-separated Time/SPEED/POWER/... and the header-rows checkbox above.")
             else:
-                st.session_state.manual_df = pd.concat(
+                st.session_state.manual_df = _coerce_numeric(pd.concat(
                     [st.session_state.manual_df, parsed], ignore_index=True
-                )
+                ))
                 st.success(f"Added {len(parsed):,} rows fetched from the link.")
-    st.caption(
-        "Plain GET, no authentication. If your link needs an API key or token, tell me and I'll add a field for it."
-    )
+    st.caption("Plain GET, no authentication. If your link needs an API key or token, tell me and I'll add a field for it.")
 
 if st.button("Clear all manual data"):
     st.session_state.manual_df = pd.DataFrame(columns=COLUMNS)
@@ -931,124 +817,84 @@ if st.button("Clear all manual data"):
 manual_df = st.session_state.manual_df
 if not manual_df.empty:
     manual_windows = segment_into_windows(manual_df, window_seconds)
-    st.caption(
-        f"{len(manual_df):,} manual rows loaded, spanning {manual_df['Time'].max():.1f}s "
-        f"→ segmented into {len(manual_windows)} window(s) of {window_seconds}s."
-    )
+    st.caption(f"{len(manual_df):,} manual rows loaded, spanning {manual_df['Time'].max():.1f}s "
+               f"→ segmented into {len(manual_windows)} window(s) of {window_seconds}s.")
 
-    labels = [
-        f"Window {i+1}: {s:.1f}s – {e:.1f}s ({len(d):,} rows)"
-        for i, (s, e, d) in enumerate(manual_windows)
-    ]
-    choice = st.selectbox(
-        "Select a window to analyze",
-        options=range(len(labels)),
-        format_func=lambda i: labels[i],
-    )
+    labels = [f"Window {i+1}: {s:.1f}s – {e:.1f}s ({len(d):,} rows)" for i, (s, e, d) in enumerate(manual_windows)]
+    choice = st.selectbox("Select a window to analyze", options=range(len(labels)), format_func=lambda i: labels[i])
     _, _, mw = manual_windows[choice]
 
     st.plotly_chart(plot_timeseries(mw, channel), use_container_width=True)
 
-    manual_raw_freqs, manual_raw_mags = compute_fft_for_channel(
-        mw, channel, sampling_rate
-    )
-    manual_fft_freqs, manual_fft_mags = mask_band(
-        manual_raw_freqs, manual_raw_mags, fft_low, fft_high
-    )
+    manual_raw_freqs, manual_raw_mags = compute_fft_for_channel(mw, channel, sampling_rate)
+    manual_fft_freqs, manual_fft_mags = mask_band(manual_raw_freqs, manual_raw_mags, fft_low, fft_high)
     mcol1, mcol2 = st.columns(2)
     with mcol1:
-        st.plotly_chart(
-            plot_fft(manual_fft_freqs, manual_fft_mags, channel, fft_low, fft_high),
-            use_container_width=True,
-        )
+        st.plotly_chart(plot_fft(manual_fft_freqs, manual_fft_mags, channel, fft_low, fft_high),
+                         use_container_width=True)
     with mcol2:
-        st.plotly_chart(plot_distribution(mw, channel), use_container_width=True)
+        try:
+            st.plotly_chart(plot_distribution(mw, channel), use_container_width=True)
+        except Exception as e:
+            st.error(f"Distribution plot failed: {e}")
 
     st.subheader("FFT Diagnostics (manual window)")
-    manual_fft_diag = compute_fft_diagnostics(
-        manual_fft_freqs, manual_fft_mags, peak_prominence_pct / 100
-    )
-    mfcols = st.columns(4)
-    for i, (k, v) in enumerate(manual_fft_diag.items()):
-        display = "N/A" if (v is None or np.isnan(v)) else f"{v:,.4f}"
-        mfcols[i % 4].metric(k, display)
+    try:
+        manual_fft_diag = compute_fft_diagnostics(manual_fft_freqs, manual_fft_mags, peak_prominence_pct / 100)
+        mfcols = st.columns(4)
+        for i, (k, v) in enumerate(manual_fft_diag.items()):
+            display = "N/A" if (v is None or np.isnan(v)) else f"{v:,.4f}"
+            mfcols[i % 4].metric(k, display)
+    except Exception as e:
+        st.error(f"FFT diagnostics failed: {e}")
 
     st.subheader("Peak Envelope & Shape Classification (manual window)")
-    st.caption(
-        f"Scoped to {shape_band_low:g}–{shape_band_high:g} Hz — independent of the {fft_low:g}–{fft_high:g} Hz FFT band above."
-    )
-    manual_shape_freqs, manual_shape_mags = mask_band(
-        manual_raw_freqs, manual_raw_mags, shape_band_low, shape_band_high
-    )
-    manual_peak_freqs, manual_peak_mags = bin_peaks_by_frequency(
-        manual_shape_freqs, manual_shape_mags, peak_bin_hz
-    )
-    if len(manual_peak_freqs) < 5:
-        st.info(
-            "Not enough bins in the shape band for analysis — widen the shape band or shrink the bin width."
-        )
-    else:
-        st.plotly_chart(
-            plot_peak_envelope_on_fft(
-                manual_shape_freqs,
-                manual_shape_mags,
-                manual_peak_freqs,
-                manual_peak_mags,
-                channel,
-                shape_band_low,
-                shape_band_high,
-                peak_bin_hz,
-            ),
-            use_container_width=True,
-        )
-        manual_shape = classify_curve_shape(
-            manual_peak_freqs, manual_peak_mags, shape_r2_threshold
-        )
-        manual_is_good = manual_shape["label"] == "Parabolic" and (
-            not require_inverted
-            or (manual_shape["concavity"] or "").startswith("downward")
-        )
-        mscols = st.columns(3)
-        mscols[0].metric(
-            "R² (quadratic fit)",
-            (
-                f"{manual_shape['r2_quadratic']:.3f}"
-                if not np.isnan(manual_shape["r2_quadratic"])
-                else "N/A"
-            ),
-        )
-        mscols[1].metric("Concavity", manual_shape["concavity"] or "N/A")
-        mscols[2].metric(
-            "Shape", "Inverted parabola" if manual_is_good else manual_shape["label"]
-        )
-        if manual_is_good:
-            st.success(
-                f"Shape: inverted parabola ({manual_shape['concavity']}) → heuristic reads as **possible good weld**."
-            )
-        elif manual_shape["label"] == "No clear shape":
-            st.warning(
-                "Shape: no clear fit → heuristic reads as **possible bad weld**."
-            )
-        elif manual_shape["label"] == "Parabolic":
-            st.info(
-                f"Shape: parabolic, but {manual_shape['concavity']} — not inverted, so it doesn't satisfy the good-weld rule as specified."
-            )
+    st.caption(f"Scoped to {shape_band_low:g}–{shape_band_high:g} Hz — independent of the {fft_low:g}–{fft_high:g} Hz FFT band above.")
+    try:
+        manual_shape_freqs, manual_shape_mags = mask_band(manual_raw_freqs, manual_raw_mags, shape_band_low, shape_band_high)
+        manual_peak_freqs, manual_peak_mags = bin_peaks_by_frequency(manual_shape_freqs, manual_shape_mags, peak_bin_hz)
+        if len(manual_peak_freqs) < 5:
+            st.info("Not enough bins in the shape band for analysis — widen the shape band or shrink the bin width.")
         else:
-            st.info(
-                f"Shape: {manual_shape['label']} — doesn't match the good-weld rule."
+            st.plotly_chart(
+                plot_peak_envelope_on_fft(manual_shape_freqs, manual_shape_mags, manual_peak_freqs, manual_peak_mags,
+                                           channel, shape_band_low, shape_band_high, peak_bin_hz),
+                use_container_width=True,
             )
-        st.caption(
-            "⚠️ Inverted-parabola-equals-good-weld is a heuristic rule you specified, not something "
-            "validated against known weld outcomes here. Check it against a batch of welds with "
-            "**confirmed** good/bad results before using this as an actual accept/reject gate."
-        )
+            manual_shape = classify_curve_shape(manual_peak_freqs, manual_peak_mags, shape_r2_threshold)
+            manual_is_good = manual_shape["label"] == "Parabolic" and (
+                not require_inverted or (manual_shape["concavity"] or "").startswith("downward")
+            )
+            mscols = st.columns(3)
+            mscols[0].metric("R² (quadratic fit)",
+                              f"{manual_shape['r2_quadratic']:.3f}" if not np.isnan(manual_shape['r2_quadratic']) else "N/A")
+            mscols[1].metric("Concavity", manual_shape["concavity"] or "N/A")
+            mscols[2].metric("Shape", "Inverted parabola" if manual_is_good else manual_shape["label"])
+            if manual_is_good:
+                st.success(f"Shape: inverted parabola ({manual_shape['concavity']}) → heuristic reads as **possible good weld**.")
+            elif manual_shape["label"] == "No clear shape":
+                st.warning("Shape: no clear fit → heuristic reads as **possible bad weld**.")
+            elif manual_shape["label"] == "Parabolic":
+                st.info(f"Shape: parabolic, but {manual_shape['concavity']} — not inverted, so it doesn't satisfy the good-weld rule as specified.")
+            else:
+                st.info(f"Shape: {manual_shape['label']} — doesn't match the good-weld rule.")
+            st.caption(
+                "⚠️ Inverted-parabola-equals-good-weld is a heuristic rule you specified, not something "
+                "validated against known weld outcomes here. Check it against a batch of welds with "
+                "**confirmed** good/bad results before using this as an actual accept/reject gate."
+            )
+    except Exception as e:
+        st.error(f"Shape classification failed: {e}")
 
     st.subheader("Time-Series Metrics (manual window)")
-    manual_metrics = compute_metrics(mw[channel])
-    mcols = st.columns(4)
-    for i, (k, v) in enumerate(manual_metrics.items()):
-        display = f"{v:,.4f}" if isinstance(v, (float, np.floating)) else f"{v}"
-        mcols[i % 4].metric(k, display)
+    try:
+        manual_metrics = compute_metrics(mw[channel])
+        mcols = st.columns(4)
+        for i, (k, v) in enumerate(manual_metrics.items()):
+            display = f"{v:,.4f}" if isinstance(v, (float, np.floating)) else f"{v}"
+            mcols[i % 4].metric(k, display)
+    except Exception as e:
+        st.error(f"Metrics failed: {e}")
 
     st.download_button(
         "Download this manual window as CSV",
