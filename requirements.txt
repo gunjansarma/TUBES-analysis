@@ -1,6 +1,6 @@
-streamlit>=1.32
+streamlit>=1.51 
 pandas>=2.0
 numpy>=1.24
 scipy>=1.10
-plotly>=5.18,<6
-kaleido>=0.2.1,<0.3
+plotly>=7.1
+kaleido>=1.5
