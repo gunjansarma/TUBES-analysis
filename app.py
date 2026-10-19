@@ -355,8 +355,9 @@ def export_plot_png(fig: go.Figure, folder: str, channel: str, window_start: flo
         fig.write_image(full_path, format="png", width=1200, height=700, scale=2)
         return True, full_path
     except Exception as e:
-        return False, (f"PNG export failed ({e}). This usually means the 'kaleido' package "
-                        f"isn't installed — run: pip install kaleido")
+        return False, (f"PNG export failed ({e}). Plot export needs Google Chrome installed on "
+                        f"this PC (the 'kaleido' package drives it). If Chrome is installed in a "
+                        f"non-standard place, set the BROWSER_PATH environment variable to chrome.exe.")
 
 
 def segment_into_windows(df: pd.DataFrame, window_seconds: float):
@@ -621,7 +622,7 @@ if st.session_state.processed_log:
     st.subheader("Processed Windows (history)")
     st.caption("Every completed window, newest first — across every file this session has worked through.")
     hist_df = pd.DataFrame(st.session_state.processed_log)
-    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    st.dataframe(hist_df, width="stretch", hide_index=True)
     st.download_button(
         "Download history as CSV",
         data=hist_df.to_csv(index=False).encode(),
@@ -642,18 +643,18 @@ w = st.session_state.current_window
 if w is not None and not w.empty:
     st.subheader(f"Window {w['Time'].min():.1f}s – {w['Time'].max():.1f}s  ({len(w):,} rows)")
 
-    st.plotly_chart(plot_timeseries(w, channel), use_container_width=True)
+    st.plotly_chart(plot_timeseries(w, channel), width="stretch")
 
     raw_freqs, raw_mags = compute_fft_for_channel(w, channel, sampling_rate)
     fft_freqs, fft_mags = mask_band(raw_freqs, raw_mags, fft_low, fft_high)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(plot_fft(fft_freqs, fft_mags, channel, fft_low, fft_high), use_container_width=True)
+        st.plotly_chart(plot_fft(fft_freqs, fft_mags, channel, fft_low, fft_high), width="stretch")
     with c2:
         # Isolated: a crash here (bad dtype, all-NaN channel, etc.) must not take the
         # shape-classification and metrics panels below it down with it.
         try:
-            st.plotly_chart(plot_distribution(w, channel), use_container_width=True)
+            st.plotly_chart(plot_distribution(w, channel), width="stretch")
         except Exception as e:
             st.error(f"Distribution plot failed: {e}")
 
@@ -678,7 +679,7 @@ if w is not None and not w.empty:
             st.plotly_chart(
                 plot_peak_envelope_on_fft(shape_freqs, shape_mags, peak_freqs, peak_mags, channel,
                                            shape_band_low, shape_band_high, peak_bin_hz),
-                use_container_width=True,
+                width="stretch",
             )
             shape = classify_curve_shape(peak_freqs, peak_mags, shape_r2_threshold)
             is_good = shape["label"] == "Parabolic" and (not require_inverted or (shape["concavity"] or "").startswith("downward"))
@@ -824,17 +825,17 @@ if not manual_df.empty:
     choice = st.selectbox("Select a window to analyze", options=range(len(labels)), format_func=lambda i: labels[i])
     _, _, mw = manual_windows[choice]
 
-    st.plotly_chart(plot_timeseries(mw, channel), use_container_width=True)
+    st.plotly_chart(plot_timeseries(mw, channel), width="stretch")
 
     manual_raw_freqs, manual_raw_mags = compute_fft_for_channel(mw, channel, sampling_rate)
     manual_fft_freqs, manual_fft_mags = mask_band(manual_raw_freqs, manual_raw_mags, fft_low, fft_high)
     mcol1, mcol2 = st.columns(2)
     with mcol1:
         st.plotly_chart(plot_fft(manual_fft_freqs, manual_fft_mags, channel, fft_low, fft_high),
-                         use_container_width=True)
+                         width="stretch")
     with mcol2:
         try:
-            st.plotly_chart(plot_distribution(mw, channel), use_container_width=True)
+            st.plotly_chart(plot_distribution(mw, channel), width="stretch")
         except Exception as e:
             st.error(f"Distribution plot failed: {e}")
 
@@ -859,7 +860,7 @@ if not manual_df.empty:
             st.plotly_chart(
                 plot_peak_envelope_on_fft(manual_shape_freqs, manual_shape_mags, manual_peak_freqs, manual_peak_mags,
                                            channel, shape_band_low, shape_band_high, peak_bin_hz),
-                use_container_width=True,
+                width="stretch",
             )
             manual_shape = classify_curve_shape(manual_peak_freqs, manual_peak_mags, shape_r2_threshold)
             manual_is_good = manual_shape["label"] == "Parabolic" and (
