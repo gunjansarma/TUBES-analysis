@@ -1,12 +1,16 @@
 name: Build Windows .exe
 
+# Builds the .exe on a real Windows machine (GitHub's own) — no Windows PC needed on your side.
 on:
   workflow_dispatch:   # lets you trigger it manually from the Actions tab
   push:
     paths:
       - "app.py"
       - "launcher.py"
+      - "requirements.txt"
       - "requirements-build.txt"
+      - "smoke_export.py"
+      - ".github/workflows/main.yml"
 
 jobs:
   build:
@@ -16,27 +20,47 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"   # the version the all-latest stack was tested on
 
       - name: Install dependencies
         run: pip install -r requirements-build.txt
 
+      # kaleido 1.x notes:
+      #  * Do NOT use --collect-all kaleido: it imports kaleido.mocker, which runs an argument parser at
+      #    import time and exits, crashing the build.
+      #  * choreographer + logistro are kaleido 1.x's new dependencies and must be bundled explicitly.
+      #  * PNG export drives an INSTALLED Google Chrome (windows-latest runners include it; every PC that
+      #    runs the .exe needs it too).
       - name: Build with PyInstaller
         run: >
           pyinstaller --onedir --name SensorStreamMonitor
           --collect-all streamlit
           --collect-all plotly
           --collect-all scipy
-          --collect-all kaleido
+          --collect-data kaleido
+          --collect-data choreographer
+          --hidden-import kaleido
+          --hidden-import choreographer
+          --hidden-import logistro
+          --exclude-module kaleido.mocker
           --copy-metadata streamlit
           --copy-metadata pandas
           --copy-metadata numpy
           --copy-metadata scipy
           --copy-metadata plotly
           --copy-metadata kaleido
+          --copy-metadata choreographer
+          --copy-metadata logistro
           --add-data "app.py;."
           --noconfirm
           launcher.py
+
+      # Freezes a tiny script with the SAME kaleido flags and runs it, so a build whose PNG auto-export
+      # would silently fail on Windows turns this workflow red instead of shipping.
+      - name: Smoke test - PNG export from a frozen Windows exe
+        run: |
+          pyinstaller --onedir --name exportprobe --collect-all plotly --collect-data kaleido --collect-data choreographer --hidden-import kaleido --hidden-import choreographer --hidden-import logistro --exclude-module kaleido.mocker --copy-metadata plotly --copy-metadata kaleido --copy-metadata choreographer --copy-metadata logistro --noconfirm smoke_export.py
+          .\dist\exportprobe\exportprobe.exe
 
       - name: Upload build as downloadable artifact
         uses: actions/upload-artifact@v4
